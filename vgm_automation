@@ -1,0 +1,660 @@
+import tkinter as tk
+from tkinter import filedialog, simpledialog
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import pyautogui
+import logging
+import sys
+USE_PYAUTOGUI_UPLOAD = True 
+import os
+
+def log_flush():
+    for handler in log.handlers:
+        handler.flush()
+import platform
+import subprocess
+import os
+def dismiss_popup_notification():
+    try:
+        popup = WebDriverWait(driver, 3).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "div.k-widget.k-window"))
+        )
+        ok_button = popup.find_element(By.ID, "showAlertBtn")
+        ok_button.click()
+        log.info("🛑 Popup notification detected and OK clicked")
+        log_flush()
+        WebDriverWait(driver, 10).until(
+            EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.k-widget.k-window"))
+        )
+    except (TimeoutException, NoSuchElementException):
+        pass
+import re
+from PyPDF2 import PdfReader, PdfWriter
+from openpyxl import Workbook
+from datetime import datetime
+from dateutil import parser
+root = tk.Tk()
+root.withdraw()
+
+input_pdf_path = filedialog.askopenfilename(
+    title="Select VGM PDF",
+    filetypes=[("PDF files", "*.pdf")]
+)
+if not input_pdf_path:
+    # Can't log yet, as log is not initialized
+    raise Exception("❌ No PDF file selected.")
+
+# Read the PDF
+reader = PdfReader(input_pdf_path)
+# Generate output folder based on input filename
+input_filename = os.path.splitext(os.path.basename(input_pdf_path))[0]
+base_output_dir = os.path.join(os.path.dirname(input_pdf_path), f"{input_filename}-VGM")
+os.makedirs(base_output_dir, exist_ok=True)
+
+# Restrict all file access to only the selected input PDF and the output folder
+allowed_base_paths = {
+    os.path.abspath(input_pdf_path),
+    os.path.abspath(base_output_dir)
+}
+
+def is_path_allowed(path):
+    abs_path = os.path.abspath(path)
+    for allowed in allowed_base_paths:
+        if abs_path == allowed or abs_path.startswith(allowed + os.sep):
+            return True
+    return False
+
+log_file = os.path.join(base_output_dir, "VGM_debug_log.txt")
+log = logging.getLogger()
+
+# --- Real-time flush logging handler ---
+class FlushFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+for handler in log.handlers[:]:
+    log.removeHandler(handler)
+
+handler = FlushFileHandler(log_file, mode='w')
+formatter = logging.Formatter('%(message)s')
+handler.setFormatter(formatter)
+log.addHandler(handler)
+log.setLevel(logging.INFO)
+
+# Define output paths
+output_excel_path = os.path.join(base_output_dir, "VGM_Data.xlsx")
+output_pdf_dir = os.path.join(base_output_dir, "Split_PDFs")
+if is_path_allowed(output_pdf_dir):
+    os.makedirs(output_pdf_dir, exist_ok=True)
+else:
+    raise PermissionError(f"Access denied: {output_pdf_dir}")
+
+# Initialize Excel workbook
+wb = Workbook()
+ws = wb.active
+ws.title = "VGM Data"
+ws.append(["CONTAINER NO.", "WEIGHT", "UNIT"])
+
+weighing_date_str = None
+
+# === Robust weighing date extraction: try all pages, use first valid, log warning if none found ===
+for i, page in enumerate(reader.pages):
+    text = page.extract_text()
+
+    date_candidates = re.findall(
+        r"(?:Date and time of Weighing|Weighing Date)?\s*[:\-]?\s*([A-Z]{3,9}\s+\d{1,2}\s+\d{4}[,]?\s*[\d.:]*\s*(?:AM|PM)?)",
+        text,
+        re.IGNORECASE
+    )
+
+    if not date_candidates:
+        continue  # Try next page
+
+    for candidate in date_candidates:
+        candidate = candidate.strip()
+        candidate = candidate.replace(".", ":")
+        candidate = candidate.replace(",", " ")  # Replace commas with space
+        candidate = re.sub(r"\bUNE\b", "JUNE", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\bJULY\b", "JUL", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\bEB\b", "FEB", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\bMARH\b", "MARCH", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\bSEPT\b", "SEP", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"[^A-Z0-9 :]", "", candidate, flags=re.IGNORECASE)  # Clean OCR junk
+
+        # Try multiple strict datetime formats
+        parsed = False
+        for fmt in ["%B %d %Y %I:%M %p", "%b %d %Y %I:%M %p", "%B %d %Y %I:%M%p", "%b %d %Y %I:%M%p"]:
+            try:
+                parsed_dt = datetime.strptime(candidate, fmt)
+                weighing_date_str = parsed_dt.strftime("%d-%b-%Y")
+                log.info(f"📅 Parsed with format '{fmt}': {weighing_date_str} (from page {i+1})")
+                log_flush()
+                parsed = True
+                break
+            except ValueError:
+                continue
+
+        # Fallback fuzzy parse if strict failed
+        if not parsed:
+            try:
+                parsed_dt = parser.parse(candidate, fuzzy=True)
+                weighing_date_str = parsed_dt.strftime("%d-%b-%Y")
+                log.info(f"📅 Fallback fuzzy parsed date: {weighing_date_str} (from page {i+1})")
+                log_flush()
+                parsed = True
+            except Exception:
+                log.warning(f"⚠️ Failed to parse date candidate '{candidate}' on page {i+1}")
+                log_flush()
+
+        if parsed:
+            break
+
+    if weighing_date_str:
+        break
+
+if not weighing_date_str:
+    log.warning("⚠️ No valid weighing date extracted from any page. Proceeding without date; manual entry needed.")
+    log_flush()
+# === Move container extraction block below date extraction ===
+for i, page in enumerate(reader.pages):
+    text = page.extract_text()
+
+    # Extract container number even if OCR split prefix and number across words
+    container_no = None
+    cleaned_text = re.sub(r"[^A-Z0-9\s]", " ", text.upper())  # Replace non-alphanum with space
+    words = cleaned_text.split()
+
+    for j in range(len(words) - 1):
+        combined = words[j] + words[j + 1]
+        if re.match(r"^[A-Z]{4}\d{7}$", combined):
+            container_no = combined
+            break
+
+    # Also check single word candidates in case there's no split
+    if not container_no:
+        for word in words:
+            if re.match(r"^[A-Z]{4}\d{7}$", word):
+                container_no = word
+                break
+
+    # Validate container number format strictly
+    if container_no is None or not re.match(r"^[A-Z]{4}\d{7}$", container_no):
+        log.warning(f"Skipped page {i+1} due to invalid container number: {container_no}")
+        log_flush()
+        continue
+    # Extract weight as before...
+    gross_match = re.search(r"Gross WT[.\s]*\(KG\)\s*[:\-]?\s*([\d.,]+)", text, re.IGNORECASE)
+    if not gross_match:
+        gross_match = re.search(r"Gross Weight[.\s]*\(KG\)\s*[:\-]?\s*([\d.,]+)", text, re.IGNORECASE)
+    gross_wt = gross_match.group(1).replace(",", "").strip() if gross_match else None
+
+    if not gross_wt:
+        log.warning(f"Skipped page {i+1} due to missing gross weight")
+        log_flush()
+        continue
+
+    ws.append([container_no, gross_wt, "KGS"])
+    log.info(f"Container {container_no} added with weight {gross_wt}")
+    log_flush()
+
+    # Save single-page PDF with container_no as filename
+    writer = PdfWriter()
+    writer.add_page(page)
+    output_pdf_path = os.path.join(output_pdf_dir, f"{container_no}.pdf")
+    if is_path_allowed(output_pdf_path):
+        with open(output_pdf_path, "wb") as f:
+            writer.write(f)
+    else:
+        raise PermissionError(f"Access denied: {output_pdf_path}")
+
+
+# Remove extra rows
+for row in ws.iter_rows(min_row=2):
+    if all(cell.value in [None, "", " "] for cell in row):
+        ws.delete_rows(row[0].row)
+
+# Save Excel file
+if is_path_allowed(output_excel_path):
+    wb.save(output_excel_path)
+else:
+    raise PermissionError(f"Access denied: {output_excel_path}")
+
+log.info("✅ Extraction and splitting complete.")
+log_flush()
+log.info(f"Excel saved to: {output_excel_path}")
+log_flush()
+log.info(f"Split PDFs saved in: {output_pdf_dir}")
+log_flush()
+
+# ======== MSC Website Automation ==========
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+USERNAME = simpledialog.askstring("MSC Login", "Enter MSC Username:")
+PASSWORD = simpledialog.askstring("MSC Login", "Enter MSC Password:", show="*")
+BOOKING_NUMBER = simpledialog.askstring(
+    "VGM Submission",
+    "Enter Booking Number or Bill of Lading:",
+    parent=root
+)
+root.update()
+root.destroy()
+
+if not USERNAME or not PASSWORD or not BOOKING_NUMBER:
+    log.error("❌ Input cancelled or incomplete.")
+    log_flush()
+    raise Exception("❌ Input cancelled or incomplete.")
+
+# Launch browser
+driver = webdriver.Chrome()
+
+MSC_BASE_URL = "https://www.msc.com/en"
+driver.get(MSC_BASE_URL)
+log.info("🌐 Opened MSC homepage")
+log_flush()
+
+# Accept cookies if the prompt appears
+try:
+    accept_cookies_button = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
+    )
+    accept_cookies_button.click()
+    log.info("🍪 Accepted cookies")
+    log_flush()
+except TimeoutException:
+    log.info("⏳ No cookie banner detected or already accepted")
+    log_flush()
+
+# Step 2: Submit the myMSC login form
+try:
+    mymsc_form = WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "li.msc-header__nav-list-mymsc form"))
+    )
+    driver.execute_script("arguments[0].submit();", mymsc_form)
+    log.info("📨 Submitted myMSC login form")
+    log_flush()
+except TimeoutException:
+    log.error("❌ Could not locate or submit the myMSC login form.")
+    log_flush()
+    driver.quit()
+    exit(1)
+
+from selenium.common.exceptions import TimeoutException
+
+try:
+    # Wait for email input to be clickable using its ID
+    email_input = WebDriverWait(driver, 20).until(
+        EC.element_to_be_clickable((By.ID, "signInName"))
+    )
+    log.info("✅ Email input is clickable")
+    log_flush()
+
+    # Wait for password input to be clickable using its ID
+    password_input = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, "password"))
+    )
+    log.info("✅ Password input is clickable")
+    log_flush()
+
+    # Enter credentials
+    email_input.send_keys(USERNAME)
+    password_input.send_keys(PASSWORD)
+
+    # Click login button (ID "next")
+    login_button = driver.find_element(By.ID, "next")
+    login_button.click()
+    log.info("➡️ Login button clicked")
+    log_flush()
+
+except TimeoutException as e:
+    log.info(f"Exception during login step: {e}")
+    log_flush()
+    with open("login_page_debug.html", "w", encoding="utf-8") as f:
+        f.write(driver.page_source)
+    driver.quit()
+    exit(1)
+
+# Allow time for the login to process
+time.sleep(10)
+log.info("🔓 Logged in successfully")
+log_flush()
+
+# Directly click 'Submit VGM' after login
+try:
+    submit_vgm_link = WebDriverWait(driver, 15).until(
+        EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'Submit VGM')]"))
+    )
+    submit_vgm_link.click()
+    log.info("📄 Navigated to Submit VGM page")
+    log_flush()
+except TimeoutException:
+    log.error("❌ Could not find 'Submit VGM' link.")
+    log_flush()
+    driver.quit()
+    exit(1)
+
+time.sleep(5)
+
+
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+# === Fill in VGM form fields (replace IDs with actual ones from browser inspection) ===
+# Fill Booking Number or Bill of Lading
+identifier_input = driver.find_element(By.ID, "VGMHeader_Identifier")
+identifier_input.clear()
+identifier_input.send_keys(BOOKING_NUMBER)
+
+# Weighing Party Info
+wp_name = driver.find_element(By.ID, "VGMHeader_WeighingPartyName")
+wp_name.clear()
+wp_name.send_keys("ELECTROSTEEL CASTINGS LIMITED")
+wp_addr = driver.find_element(By.ID, "VGMHeader_WeighingPartyAddress")
+wp_addr.clear()
+wp_addr.send_keys("19 CAMAC STREET")
+wp_loc = driver.find_element(By.ID, "VGMHeader_WeighingPartyLocation")
+wp_loc.clear()
+wp_loc.send_keys("KOLKATA")
+wp_postal = driver.find_element(By.ID, "VGMHeader_WeighingPartyPostalCode")
+wp_postal.clear()
+wp_postal.send_keys("700017")
+driver.execute_script("""
+  var dropdown = $('#wpCountry').data('kendoDropDownList');
+  var data = dropdown.dataSource.data();
+  for (var i = 0; i < data.length; i++) {
+    if (data[i].Code === 'IN') {
+      dropdown.value(data[i].CountryId);
+      dropdown.trigger('change');
+      return;
+    }
+  }
+  console.warn('Country IN not found in dropdown');
+""")
+# Use the weighing_date_str extracted from the PDF pages above
+weighing_date_str = weighing_date_str  # Already extracted from PDF pages
+
+driver.execute_script(f"""
+var input = document.getElementById("VGMHeader_WeighingDate");
+if (input) {{
+    var dateStr = "{weighing_date_str.replace(' ', '-')}";
+    input.value = dateStr;
+
+    var eventInput = new Event('input', {{ bubbles: true }});
+    input.dispatchEvent(eventInput);
+
+    var eventChange = new Event('change', {{ bubbles: true }});
+    input.dispatchEvent(eventChange);
+
+    console.log("📅 [DEBUG] WeighingDate input field set to: " + dateStr);
+}} else {{
+    console.warn("WeighingDate input not found");
+}}
+""")
+
+log.info("🧾 Entered Booking and Weighing Party Info")
+log_flush()
+
+driver.find_element(By.CSS_SELECTOR, "label[for='radio1_']").click()
+log.info("✅ Selected Weighing Method")
+log_flush()
+
+# Responsible Party (same as Weighing Party)
+rp_name = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyName")
+rp_name.clear()
+rp_name.send_keys("ELECTROSTEEL CASTINGS LIMITED")
+rp_contact = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyContact")
+rp_contact.clear()
+rp_contact.send_keys("07003666243")
+rp_addr = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyAddress")
+rp_addr.clear()
+rp_addr.send_keys("19 CAMAC STREET")
+rp_loc = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyLocation")
+rp_loc.clear()
+rp_loc.send_keys("KOLKATA")
+rp_postal = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyPostalCode")
+rp_postal.clear()
+rp_postal.send_keys("700017")
+vgm_email = driver.find_element(By.ID, "vgmEmail")
+vgm_email.clear()
+vgm_email.send_keys("")  # Left blank as per screenshot
+rp_phone = driver.find_element(By.ID, "VGMHeader_ResponsiblePartyPhone")
+rp_phone.clear()
+rp_phone.send_keys("07003666243")
+log.info("👥 Entered Responsible Party Info")
+log_flush()
+
+# Signature Name
+sig_input = driver.find_element(By.ID, "VGMHeader_SignaturParty")
+sig_input.clear()
+sig_input.send_keys("Priyo Ranjan Pramanik")
+
+time.sleep(2)
+driver.execute_script("""
+var input = document.getElementById("VGMHeader_DeclarationDate");
+if (input) {
+    var dateStr = kendo.toString(new Date(), "dd-MMM-yyyy");
+    input.value = dateStr;
+
+    var eventInput = new Event('input', { bubbles: true });
+    input.dispatchEvent(eventInput);
+
+    var eventChange = new Event('change', { bubbles: true });
+    input.dispatchEvent(eventChange);
+
+    console.log("DeclarationDate set to " + dateStr);
+} else {
+    console.warn("DeclarationDate input not found");
+}
+""")
+
+log.info("✍️ Entered Signature Information")
+log_flush()
+
+# Wait for the file input and send the file path directly
+file_input = WebDriverWait(driver, 10).until(
+    EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+)
+driver.execute_script("arguments[0].style.display = 'block';", file_input)
+file_input.send_keys(output_excel_path)
+log.info(f"📂 Sent Excel file path to input: {output_excel_path}")
+
+# Dispatch 'change' event to simulate user file selection
+driver.execute_script("arguments[0].dispatchEvent(new Event('change'))", file_input)
+
+# Wait briefly for upload to process (adjust if you have a better confirmation element)
+time.sleep(3)
+
+# === Upload container PDFs before submitting the form ===
+# Wait for container table to load
+WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//table")))
+log.info("📦 Container upload table detected")
+log_flush()
+
+# Delete empty rows before uploading PDFs
+rows = driver.find_elements(By.XPATH, "//div[@id='ContainerGrid']//tbody/tr")
+
+for row in rows:
+    try:
+        container_no = row.find_element(By.CSS_SELECTOR, "td.cntrNumber").text.strip()
+        weight = row.find_element(By.CSS_SELECTOR, "td.wht").text.strip()
+
+        if not container_no or not weight:
+            dismiss_popup_notification()
+            delete_button = row.find_element(By.ID, "prepareDelete")
+            delete_button.click()
+            time.sleep(2)
+            log.info(f"🗑️ Deleted empty row with container='{container_no}' weight='{weight}'")
+            log_flush()
+
+    except Exception:
+        pass
+
+# Fetch rows fresh after deletions
+rows = driver.find_elements(By.XPATH, "//div[@id='ContainerGrid']//tbody/tr")
+
+# Upload container PDFs robustly (updated block)
+for i in range(len(rows)):
+    try:
+        rows = driver.find_elements(By.XPATH, "//div[@id='ContainerGrid']//tbody/tr")
+        row = rows[i]
+
+        # Retry fetching valid container number and weight up to 2 times
+        container_no = ""
+        weight = ""
+        for attempt in range(2):
+            try:
+                container_no = row.find_element(By.CSS_SELECTOR, "td.cntrNumber").text.strip()
+                weight = row.find_element(By.CSS_SELECTOR, "td.wht").text.strip()
+                if container_no and weight:
+                    break
+                else:
+                    log.warning(f"⚠️ Attempt {attempt+1}: Container number or weight missing.")
+                    time.sleep(2)
+            except Exception as e:
+                log.warning(f"⚠️ Attempt {attempt+1}: Exception while reading row data: {e}")
+                time.sleep(2)
+
+        if not container_no or not weight:
+            log.warning(f"❌ Skipped row after retries due to missing container_no='{container_no}', weight='{weight}'")
+            log_flush()
+            continue
+
+        try:
+            save_button = row.find_element(By.ID, "saveContainer")
+            onclick_attr = save_button.get_attribute("onclick")
+            if 'saveContainer("",' in onclick_attr:
+                log.warning(f"❌ Skipped row with invalid onclick attribute: {onclick_attr}")
+                log_flush()
+                continue
+        except Exception as e:
+            log.error(f"❌ Skipped row due to missing save button or error: {e}")
+            log_flush()
+            continue
+
+        dismiss_popup_notification()
+        log.info(f"Uploading PDF for container: {container_no}")
+        log_flush()
+
+        file_path = os.path.join(output_pdf_dir, f"{container_no}.pdf")
+        if not is_path_allowed(file_path) or not os.path.exists(file_path):
+            log.error(f"PDF file not found or access denied for: {container_no}")
+            log_flush()
+            continue
+        # Extract arguments from onclick attribute
+        onclick_attr = save_button.get_attribute("onclick")  # e.g. saveContainer("MSMU8540737", 2)
+        import re
+        match = re.search(r'saveContainer\("([^"]*)",\s*(\d+)\)', onclick_attr)
+        if match:
+            container_arg = match.group(1)
+            index_arg = int(match.group(2))
+        else:
+            container_arg = container_no
+            index_arg = i + 1  # fallback
+
+        # Click the upload button to trigger the file dialog
+        save_button.click()
+        time.sleep(2)  # Wait for dialog to open
+
+        # Type the full file path and press Enter using pyautogui, with a toggle and debug handling
+        if is_path_allowed(file_path) and os.path.exists(file_path):
+            log.info(f"Using pyautogui to upload: {file_path}")
+            log_flush()
+            if USE_PYAUTOGUI_UPLOAD:
+                try:
+                    time.sleep(2)
+                    full_file_path = os.path.abspath(file_path)
+                    import pyperclip  # Make sure this is installed
+
+                    if platform.system() == "Darwin":
+                        pyautogui.hotkey('command', 'shift', 'g')  # Open 'Go to Folder' dialog on macOS
+                        time.sleep(1)
+                        pyperclip.copy(full_file_path)
+                        pyautogui.hotkey('command', 'v')
+                        time.sleep(0.5)
+                        pyautogui.press('return')
+                        time.sleep(1)
+                        pyautogui.press('return')
+                        time.sleep(3)
+                    elif platform.system() == "Windows":
+                        pyperclip.copy(full_file_path)
+                        time.sleep(1)
+                        pyautogui.hotkey('ctrl', 'v')
+                        time.sleep(1)
+                        pyautogui.press('enter')
+                except Exception as e:
+                    log.error(f"pyautogui failed: {e}")
+                    log_flush()
+            else:
+                log.info("pyautogui upload skipped (disabled via flag)")
+                log_flush()
+        else:
+            log.error(f"File not found or access denied for pyautogui upload: {file_path}")
+            log_flush()
+
+    except Exception as e:
+        log.error(f"Failed to upload for container {container_no}: {e}")
+        log_flush()
+submit_button_xpath = "//button[@onclick='submitForm()' and contains(text(),'Submit')]"
+
+log.info("Waiting for you to submit the form manually...")
+log_flush()
+while True:
+    try:
+        submit_button = driver.find_element(By.XPATH, submit_button_xpath)
+        if not submit_button.is_enabled():
+            log.info("Submit button disabled — submission detected.")
+            log_flush()
+            break
+    except Exception:
+        # Submit button not found, assume submission done or page navigated
+        log.info("Submit button not found — assuming submission done.")
+        log_flush()
+        break
+    time.sleep(3)
+log.info("Submission detected, waiting 2 minutes before attempting logout.")
+log_flush()
+time.sleep(120)
+
+try:
+    log.info("Attempting to logout...")
+    log_flush()
+
+    # Step 1: Click the profile button (top right)
+    profile_button = WebDriverWait(driver, 20).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "button.msc-header__nav-item--last"))
+    )
+    profile_button.click()
+    log.info("👤 Profile menu clicked")
+    log_flush()
+
+    time.sleep(3)  # Wait for user-side-bar to load
+
+    # Step 2: Access shadow DOM and click logout via JS
+    logout_script = """
+    const sidebar = document.querySelector('user-side-bar');
+    if (!sidebar) return 'Sidebar not found';
+    const shadow = sidebar.shadowRoot;
+    if (!shadow) return 'No shadow root on sidebar';
+    const button = shadow.querySelector('button[test-id="user-sidebar-logout"]');
+    if (!button) return 'Logout button not found in shadow';
+    button.click();
+    return 'Logout clicked';
+    """
+    result = driver.execute_script(logout_script)
+    log.info(f"🔒 Logout result: {result}")
+    log_flush()
+    time.sleep(3)
+
+except Exception as e:
+    import traceback
+    error_details = traceback.format_exc()
+    log.warning(f"⚠️ Logout attempt failed: {e}\n{error_details}")
+    log_flush()
+
+log.info("🛑 Browser session ended")
+log_flush()
+driver.quit()
